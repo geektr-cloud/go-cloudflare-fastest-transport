@@ -1,6 +1,8 @@
 package cftransport
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -39,7 +41,7 @@ func TestCfNodeSet_Refresh(t *testing.T) {
 	// At least some should not be banned
 	var active int
 	for _, ns := range list {
-		if !ns.isBanned() {
+		if !ns.IsBanned() {
 			active++
 			t.Logf("active node: %s", ns.Node)
 		}
@@ -73,7 +75,7 @@ func TestCfNodeSet_Refresh_PreservesBan(t *testing.T) {
 	for _, ns := range list {
 		if ns.Node == "192.0.2.99" {
 			found = true
-			if !ns.isBanned() {
+			if !ns.IsBanned() {
 				t.Error("expected 192.0.2.99 to remain banned")
 			}
 		}
@@ -136,19 +138,86 @@ func TestCfNodeSet_Filter_SkipsBanned(t *testing.T) {
 func TestCfNodeStatus_IsBanned(t *testing.T) {
 	// Not banned (zero time)
 	ns := CfNodeStatus{Node: "1.1.1.1"}
-	if ns.isBanned() {
+	if ns.IsBanned() {
 		t.Error("zero BanExpire should not be banned")
 	}
 
 	// Banned (future)
 	ns.BanExpire = time.Now().Add(1 * time.Hour)
-	if !ns.isBanned() {
+	if !ns.IsBanned() {
 		t.Error("future BanExpire should be banned")
 	}
 
 	// Expired ban (past)
 	ns.BanExpire = time.Now().Add(-1 * time.Hour)
-	if ns.isBanned() {
+	if ns.IsBanned() {
 		t.Error("past BanExpire should not be banned")
+	}
+}
+
+func TestCfNodeSet_CSVPersistence(t *testing.T) {
+	dir := t.TempDir()
+	csvPath := filepath.Join(dir, "nodes.csv")
+
+	// Create a node set with file, add some data
+	s := NewCfNodeSetWithFile(csvPath)
+	s.mu.Lock()
+	s.list = []CfNodeStatus{
+		{Node: "104.16.1.1", BanExpire: time.Time{}},
+		{Node: "192.0.2.1", BanExpire: time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)},
+	}
+	s.save()
+	s.mu.Unlock()
+
+	// Verify file was created
+	if _, err := os.Stat(csvPath); err != nil {
+		t.Fatalf("CSV file not created: %v", err)
+	}
+
+	// Load into a new node set
+	s2 := NewCfNodeSetWithFile(csvPath)
+	list := s2.List()
+	if len(list) != 2 {
+		t.Fatalf("expected 2 nodes from CSV, got %d", len(list))
+	}
+
+	// Verify data
+	if list[0].Node != "104.16.1.1" {
+		t.Errorf("expected first node 104.16.1.1, got %s", list[0].Node)
+	}
+	if list[0].IsBanned() {
+		t.Error("first node should not be banned")
+	}
+	if list[1].Node != "192.0.2.1" {
+		t.Errorf("expected second node 192.0.2.1, got %s", list[1].Node)
+	}
+	if !list[1].IsBanned() {
+		t.Error("second node should be banned (expires 2099)")
+	}
+}
+
+func TestCfNodeSet_CSVPersistence_Ban(t *testing.T) {
+	dir := t.TempDir()
+	csvPath := filepath.Join(dir, "nodes.csv")
+
+	s := NewCfNodeSetWithFile(csvPath)
+	s.mu.Lock()
+	s.list = []CfNodeStatus{
+		{Node: "104.16.1.1"},
+		{Node: "104.16.2.2"},
+	}
+	s.save()
+	s.mu.Unlock()
+
+	// Ban a node — should persist
+	s.Ban("104.16.1.1")
+
+	// Reload
+	s2 := NewCfNodeSetWithFile(csvPath)
+	list := s2.List()
+	for _, ns := range list {
+		if ns.Node == "104.16.1.1" && !ns.IsBanned() {
+			t.Error("ban should persist to CSV")
+		}
 	}
 }

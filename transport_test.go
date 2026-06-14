@@ -28,7 +28,7 @@ func TestTransport_RealRoundRobin(t *testing.T) {
 	list := s.List()
 	var pool []poolEntry
 	for _, ns := range list {
-		if !ns.isBanned() {
+		if !ns.IsBanned() {
 			pool = append(pool, poolEntry{ip: string(ns.Node)})
 		}
 	}
@@ -101,7 +101,7 @@ func TestTransport_FailoverAndBan(t *testing.T) {
 	}
 	list := s.List()
 	for _, ns := range list {
-		if ns.Node == "192.0.2.1" && !ns.isBanned() {
+		if ns.Node == "192.0.2.1" && !ns.IsBanned() {
 			t.Error("expected 192.0.2.1 to be banned after consecutive failures")
 		}
 	}
@@ -121,7 +121,7 @@ func TestTransport_FailoverToGoodNode(t *testing.T) {
 	list := s.List()
 	var goodIP string
 	for _, ns := range list {
-		if !ns.isBanned() {
+		if !ns.IsBanned() {
 			goodIP = string(ns.Node)
 			break
 		}
@@ -181,7 +181,7 @@ func TestTransport_SuccessResetsFailures(t *testing.T) {
 	list := s.List()
 	var goodIP string
 	for _, ns := range list {
-		if !ns.isBanned() {
+		if !ns.IsBanned() {
 			goodIP = string(ns.Node)
 			break
 		}

@@ -1,7 +1,9 @@
 package cftransport
 
 import (
+	"encoding/csv"
 	"math/rand"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -18,20 +20,29 @@ type CfNodeStatus struct {
 	BanExpire time.Time
 }
 
-// isBanned returns true if the node is currently banned.
-func (s *CfNodeStatus) isBanned() bool {
+// IsBanned returns true if the node is currently banned.
+func (s *CfNodeStatus) IsBanned() bool {
 	return !s.BanExpire.IsZero() && time.Now().Before(s.BanExpire)
 }
 
 // CfNodeSet manages a set of Cloudflare edge nodes.
 type CfNodeSet struct {
-	mu   sync.Mutex
-	list []CfNodeStatus
+	mu       sync.Mutex
+	list     []CfNodeStatus
+	filePath string // optional CSV persistence path
 }
 
 // NewCfNodeSet creates an empty node set.
 func NewCfNodeSet() *CfNodeSet {
 	return &CfNodeSet{}
+}
+
+// NewCfNodeSetWithFile creates a node set that persists state to a CSV file.
+// If the file exists, the node list is loaded from it.
+func NewCfNodeSetWithFile(path string) *CfNodeSet {
+	s := &CfNodeSet{filePath: path}
+	s.load()
+	return s
 }
 
 // pingResult holds the result of a ping test for sorting.
@@ -90,7 +101,7 @@ func (s *CfNodeSet) Refresh(topN int) error {
 	// Collect currently banned nodes
 	bannedSet := make(map[CfNode]time.Time)
 	for _, ns := range s.list {
-		if ns.isBanned() {
+		if ns.IsBanned() {
 			bannedSet[ns.Node] = ns.BanExpire
 		}
 	}
@@ -113,6 +124,7 @@ func (s *CfNodeSet) Refresh(topN int) error {
 	}
 
 	s.list = newList
+	s.save()
 	return nil
 }
 
@@ -153,7 +165,7 @@ func (s *CfNodeSet) Filter(opts FilterOptions) []string {
 
 		s.mu.Lock()
 		ns := &s.list[idx]
-		if ns.isBanned() {
+		if ns.IsBanned() {
 			s.mu.Unlock()
 			continue
 		}
@@ -245,6 +257,9 @@ func (s *CfNodeSet) Filter(opts FilterOptions) []string {
 
 	// Merge accepted + remaining, return topN
 	result := append(accepted, remaining...)
+	s.mu.Lock()
+	s.save()
+	s.mu.Unlock()
 	if len(result) > opts.TopN {
 		return result[:opts.TopN]
 	}
@@ -316,6 +331,7 @@ func (s *CfNodeSet) Ban(node CfNode) {
 	for i := range s.list {
 		if s.list[i].Node == node {
 			s.list[i].BanExpire = time.Now().Add(banDuration)
+			s.save()
 			return
 		}
 	}
@@ -328,4 +344,64 @@ func (s *CfNodeSet) List() []CfNodeStatus {
 	cp := make([]CfNodeStatus, len(s.list))
 	copy(cp, s.list)
 	return cp
+}
+
+// load reads the node list from the CSV file. Called on construction.
+func (s *CfNodeSet) load() {
+	if s.filePath == "" {
+		return
+	}
+	f, err := os.Open(s.filePath)
+	if err != nil {
+		return // file doesn't exist yet, start fresh
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	records, err := r.ReadAll()
+	if err != nil {
+		return
+	}
+
+	for i, record := range records {
+		if i == 0 && len(record) > 0 && record[0] == "ip" {
+			continue // skip header
+		}
+		if len(record) < 2 {
+			continue
+		}
+		ns := CfNodeStatus{Node: CfNode(record[0])}
+		if record[1] != "0" && record[1] != "" {
+			if t, err := time.Parse(time.RFC3339, record[1]); err == nil {
+				ns.BanExpire = t
+			}
+		}
+		s.list = append(s.list, ns)
+	}
+}
+
+// save writes the current node list to the CSV file.
+// Must be called with s.mu held.
+func (s *CfNodeSet) save() {
+	if s.filePath == "" {
+		return
+	}
+	tmp := s.filePath + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return
+	}
+
+	w := csv.NewWriter(f)
+	w.Write([]string{"ip", "ban_expire"})
+	for _, ns := range s.list {
+		banStr := "0"
+		if !ns.BanExpire.IsZero() {
+			banStr = ns.BanExpire.Format(time.RFC3339)
+		}
+		w.Write([]string{string(ns.Node), banStr})
+	}
+	w.Flush()
+	f.Close()
+	os.Rename(tmp, s.filePath)
 }

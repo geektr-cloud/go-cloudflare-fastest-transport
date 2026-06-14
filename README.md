@@ -1,6 +1,8 @@
 # go-cloudflare-fastest-transport
 
-Go library for Cloudflare IP optimization. Automatically discovers the fastest Cloudflare edge nodes from your location and provides an `http.RoundTripper` that load-balances traffic across them with automatic failover.
+Go library for Cloudflare IP optimization (优选 IP). Automatically discovers the fastest Cloudflare edge nodes from your location and provides an `http.RoundTripper` that load-balances traffic across them with automatic failover.
+
+Also includes `cf-tunnel`, a TCP proxy CLI that routes any HTTPS traffic through optimized CF nodes.
 
 ## Install
 
@@ -8,7 +10,50 @@ Go library for Cloudflare IP optimization. Automatically discovers the fastest C
 go get github.com/geektr-cloud/go-cloudflare-fastest-transport
 ```
 
-## Usage
+## cf-tunnel CLI
+
+A TCP-level proxy that forwards connections to Cloudflare edge nodes with round-robin load balancing.
+
+### Build
+
+```bash
+go build -o cf-tunnel ./cmd/cf-tunnel
+```
+
+### Run
+
+```bash
+# Default: listen on port 443, discover 3 best nodes
+sudo cf-tunnel
+
+# Custom port (non-root)
+cf-tunnel --port 8443
+
+# Options
+cf-tunnel --port 8443 --top 5 --file my-nodes.csv
+```
+
+### Usage
+
+```bash
+# If listening on port 443:
+curl --resolve 'mirs.uk:443:127.0.0.1' 'https://mirs.uk/path/to/file'
+
+# If listening on a non-standard port (e.g. 8443), use --connect-to:
+curl --connect-to 'mirs.uk:443:127.0.0.1:8443' 'https://mirs.uk/path/to/file'
+
+# Download example
+curl -o debian.iso --connect-to 'mirs.uk:443:127.0.0.1:8443' \
+  'https://mirs.uk/debian-cd/current/amd64/iso-cd/debian-13.5.0-amd64-netinst.iso'
+```
+
+Note: use `--connect-to` (not `--resolve`) with non-standard ports. `--resolve` causes curl to include the port in the HTTP Host header, which CF/origin servers may reject.
+
+### Persistence
+
+Node discovery results are saved to a CSV file (`cf-nodes.csv` by default). On next startup, if enough active nodes exist in the file, the expensive Refresh step is skipped.
+
+## Library Usage
 
 ```go
 package main
@@ -23,13 +68,16 @@ import (
 )
 
 func main() {
-    // 1. Create a node set and discover best nodes
-    nodeSet := cft.NewCfNodeSet()
+    // With file persistence (skips Refresh on subsequent runs)
+    nodeSet := cft.NewCfNodeSetWithFile("cf-nodes.csv")
+
+    // Or without persistence
+    // nodeSet := cft.NewCfNodeSet()
+
     if err := nodeSet.Refresh(10); err != nil {
         panic(err)
     }
 
-    // 2. Create a Transport with filtering options
     transport := nodeSet.Transport(cft.FilterOptions{
         EliminateDelay: 500 * time.Millisecond,
         TargetDelay:    200 * time.Millisecond,
@@ -38,7 +86,6 @@ func main() {
         TopN:           3,
     })
 
-    // 3. Use as http.Client transport
     client := &http.Client{Transport: transport}
     resp, err := client.Get("https://your-cf-site.com/api/data")
     if err != nil {
@@ -73,6 +120,12 @@ Tests nodes against speed/delay thresholds:
 - 3 consecutive failures → ban for 1 hour, remove from pool
 - When the last node fails, automatically re-filters for fresh nodes
 
+### cf-tunnel (TCP proxy)
+
+- Pure layer-4 forwarding — no TLS termination, no protocol inspection
+- Accepts TCP connections, dials a CF edge IP on port 443, pipes bytes bidirectionally
+- Proper TCP half-close handling for clean connection teardown
+
 ## API
 
 ### CfNode
@@ -89,6 +142,7 @@ func (n CfNode) SpeedTest(timeout time.Duration) (speed float64, err error)
 
 ```go
 func NewCfNodeSet() *CfNodeSet
+func NewCfNodeSetWithFile(path string) *CfNodeSet
 func (s *CfNodeSet) Refresh(topN int) error
 func (s *CfNodeSet) Filter(opts FilterOptions) []string
 func (s *CfNodeSet) Transport(opts FilterOptions) *Transport
@@ -108,11 +162,22 @@ type FilterOptions struct {
 }
 ```
 
+## CSV Format
+
+```csv
+ip,ban_expire
+104.16.1.1,0
+192.0.2.1,2026-06-13T12:00:00Z
+```
+
+`ban_expire` is `0` for active nodes, or an RFC3339 timestamp.
+
 ## Testing
 
 ```bash
-go test ./...           # full suite with real network tests (~80s)
+go test ./...           # full suite with real network tests (~80s per phase)
 go test -short ./...    # local-only tests (fast)
+go vet ./...            # lint
 ```
 
 ## License
