@@ -1,8 +1,10 @@
 # go-cloudflare-fastest-transport
 
-Go library for Cloudflare IP optimization (优选 IP). Automatically discovers the fastest Cloudflare edge nodes from your location and provides an `http.RoundTripper` that load-balances traffic across them with automatic failover.
+Go library for Cloudflare IP optimization (优选 IP). Discovers the fastest Cloudflare edge nodes from your location and provides an `http.RoundTripper` that load-balances traffic across them with automatic failover.
 
-Also includes `cf-tunnel`, a TCP proxy CLI that routes any HTTPS traffic through optimized CF nodes.
+Zero external dependencies. Lock-free pool management via immutable snapshots + CAS.
+
+Also includes `cf-tunnel`, a TCP proxy CLI that routes HTTPS traffic through optimized CF nodes.
 
 ## Install
 
@@ -12,28 +14,21 @@ go get github.com/geektr-cloud/go-cloudflare-fastest-transport
 
 ## cf-tunnel CLI
 
-A TCP-level proxy that forwards connections to Cloudflare edge nodes with round-robin load balancing.
+A layer-4 TCP proxy that forwards connections to Cloudflare edge nodes with round-robin load balancing.
 
-### Build
+### Build & Run
 
 ```bash
 go build -o cf-tunnel ./cmd/cf-tunnel
-```
 
-### Run
-
-```bash
-# Default: listen on port 443, discover 3 best nodes
+# Default: listen on port 443, pool of 20 nodes
 sudo cf-tunnel
 
-# Custom port (non-root)
-cf-tunnel --port 8443
-
-# Options
-cf-tunnel --port 8443 --top 5 --file my-nodes.csv
+# Custom port and pool size
+cf-tunnel --port 8443 --pool 30 --file my-nodes.csv
 ```
 
-### Usage
+### Client Usage
 
 ```bash
 # If listening on port 443:
@@ -47,11 +42,7 @@ curl -o debian.iso --connect-to 'mirs.uk:443:127.0.0.1:8443' \
   'https://mirs.uk/debian-cd/current/amd64/iso-cd/debian-13.5.0-amd64-netinst.iso'
 ```
 
-Note: use `--connect-to` (not `--resolve`) with non-standard ports. `--resolve` causes curl to include the port in the HTTP Host header, which CF/origin servers may reject.
-
-### Persistence
-
-Node discovery results are saved to a CSV file (`cf-nodes.csv` by default). On next startup, if enough active nodes exist in the file, the expensive Refresh step is skipped.
+Note: use `--connect-to` (not `--resolve`) with non-standard ports. `--resolve` puts the port in the HTTP Host header, which CF/origin servers reject.
 
 ## Library Usage
 
@@ -68,24 +59,22 @@ import (
 )
 
 func main() {
-    // With file persistence (skips Refresh on subsequent runs)
-    nodeSet := cft.NewCfNodeSetWithFile("cf-nodes.csv")
+    // Create pool manager (20 IPs in reservoir, persisted to CSV)
+    mgr := cft.NewPoolManagerWithFile(20, "cf-nodes.csv")
 
-    // Or without persistence
-    // nodeSet := cft.NewCfNodeSet()
+    // Or without persistence:
+    // mgr := cft.NewPoolManager(20)
 
-    if err := nodeSet.Refresh(10); err != nil {
-        panic(err)
-    }
+    // Discover nodes (skips if pool is >61.8% full)
+    mgr.RefreshPool()
 
-    transport := nodeSet.Transport(cft.FilterOptions{
-        EliminateDelay: 500 * time.Millisecond,
-        TargetDelay:    200 * time.Millisecond,
-        EliminateSpeed: 1 * 1024 * 1024,  // 1 MB/s
-        TargetSpeed:    5 * 1024 * 1024,   // 5 MB/s
-        TopN:           3,
+    // Create Transport with 3 upstream IPs in rotation
+    transport := mgr.Transport(cft.TransportOptions{
+        UpstreamCount:  3,
+        EliminateDelay: 5 * time.Second,
     })
 
+    // Use as http.Client transport
     client := &http.Client{Transport: transport}
     resp, err := client.Get("https://your-cf-site.com/api/data")
     if err != nil {
@@ -97,34 +86,32 @@ func main() {
 }
 ```
 
-## How It Works
+## Architecture
 
-### Node Discovery (`Refresh`)
+### Pool (Immutable, Lock-Free)
 
-1. Generates ~6000 candidate IPs from Cloudflare's published IPv4 CIDR ranges
-2. TCP ping all candidates concurrently (200 goroutines) to find reachable nodes
-3. HTTP ping the top 5×N nodes to measure real latency
-4. Returns the best N nodes, respecting any existing ban list
+The `Pool` is an immutable value holding `[]string` entries and a `map[string]int` failure counter. All mutations produce a new `Pool` and swap it atomically via `CompareAndSwap`. No mutexes on the read path.
 
-### Node Selection (`Filter`)
+### PoolManager
 
-Tests nodes against speed/delay thresholds:
-- Nodes below `EliminateSpeed` or above `EliminateDelay` are banned for 1 hour
-- Nodes above `TargetSpeed` or below `TargetDelay` are accepted immediately
-- If not enough nodes meet targets, applies a golden-ratio (0.618) fallback threshold
+- `Refresh()` — TCP ping ~6000 candidates → HTTP ping top 5×poolSize → store top poolSize
+- `RefreshPool()` — skips if healthy nodes > 61.8% of poolSize
+- `ForceRefreshPool()` — deduplicated via version check (concurrent calls coalesce)
+- `Take(n, &index)` — returns n IPs round-robin; triggers background refresh when remaining < 2n
+- `RecordFailure(node)` — CAS-increments failure; at 3 failures removes from pool + persists
+- `RecordSuccess(node)` — CAS-resets failure counter
 
 ### Transport (`http.RoundTripper`)
 
-- Round-robin load balancing across selected nodes
-- Tracks consecutive failures per node
-- 3 consecutive failures → ban for 1 hour, remove from pool
-- When the last node fails, automatically re-filters for fresh nodes
+- Maintains a small `UpstreamCount` subset for cache-friendly rotation
+- Caches `*http.Transport` per upstream IP (TLS connection reuse)
+- On upstream eviction, lazily refreshes from pool via `Take()`
 
-### cf-tunnel (TCP proxy)
+### cf-tunnel (TCP Proxy)
 
-- Pure layer-4 forwarding — no TLS termination, no protocol inspection
-- Accepts TCP connections, dials a CF edge IP on port 443, pipes bytes bidirectionally
-- Proper TCP half-close handling for clean connection teardown
+- Pure layer-4: accepts TCP, dials CF edge :443, pipes bidirectionally
+- Proper TCP half-close for clean teardown
+- Only records failures (dial errors); no success tracking for TCP streams
 
 ## API
 
@@ -135,48 +122,57 @@ type CfNode string
 
 func (n CfNode) TCPPing(timeout time.Duration) (delay time.Duration, lossRate float64, err error)
 func (n CfNode) HTTPPing(timeout time.Duration) (delay time.Duration, lossRate float64, err error)
-func (n CfNode) SpeedTest(timeout time.Duration) (speed float64, err error)
+func (n CfNode) SpeedTest(timeout time.Duration) (speed float64, err error)  // bytes/sec
 ```
 
-### CfNodeSet
+### PoolManager
 
 ```go
-func NewCfNodeSet() *CfNodeSet
-func NewCfNodeSetWithFile(path string) *CfNodeSet
-func (s *CfNodeSet) Refresh(topN int) error
-func (s *CfNodeSet) Filter(opts FilterOptions) []string
-func (s *CfNodeSet) Transport(opts FilterOptions) *Transport
-func (s *CfNodeSet) Ban(node CfNode)
-func (s *CfNodeSet) List() []CfNodeStatus
+func NewPoolManager(poolSize int) *PoolManager
+func NewPoolManagerWithFile(poolSize int, path string) *PoolManager
+
+func (m *PoolManager) Refresh() error
+func (m *PoolManager) RefreshPool()
+func (m *PoolManager) ForceRefreshPool()
+func (m *PoolManager) Take(n int, index *atomic.Uint64) []string
+func (m *PoolManager) RecordFailure(node CfNode)
+func (m *PoolManager) RecordSuccess(node CfNode)
+func (m *PoolManager) PoolEntries() []string
+func (m *PoolManager) PoolLen() int
 ```
 
-### FilterOptions
+### Transport
 
 ```go
-type FilterOptions struct {
-    EliminateSpeed float64       // bytes/s — below this, ban
-    TargetSpeed    float64       // bytes/s — above this, accept
-    EliminateDelay time.Duration // above this, ban
-    TargetDelay    time.Duration // below this, accept
-    TopN           int
+type TransportOptions struct {
+    UpstreamCount  int           // IPs in rotation (limits cache pollution)
+    EliminateDelay time.Duration // dial timeout
 }
+
+func (m *PoolManager) Transport(opts TransportOptions) *Transport
+func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error)
+func (t *Transport) PoolSize() int
+func (t *Transport) UpstreamSize() int
 ```
 
 ## CSV Format
 
 ```csv
-ip,ban_expire
-104.16.1.1,0
-192.0.2.1,2026-06-13T12:00:00Z
+ip
+104.16.1.1
+108.162.192.5
+172.67.23.100
 ```
 
-`ban_expire` is `0` for active nodes, or an RFC3339 timestamp.
+Simple one-column format. Failed IPs are removed permanently.
 
 ## Testing
 
 ```bash
-go test ./...           # full suite with real network tests (~80s per phase)
+go build ./...          # build all
+go test ./...           # full suite with network tests (~80s)
 go test -short ./...    # local-only tests (fast)
+go test -race ./...     # with race detector
 go vet ./...            # lint
 ```
 

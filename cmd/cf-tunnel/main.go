@@ -14,41 +14,22 @@ import (
 
 func main() {
 	port := flag.Int("port", 443, "listen port")
-	topN := flag.Int("top", 3, "number of CF nodes to maintain")
+	poolSize := flag.Int("pool", 20, "number of CF nodes to maintain in reservoir")
 	file := flag.String("file", "cf-nodes.csv", "CSV file for node persistence")
 	flag.Parse()
 
-	log.Printf("initializing node set from %s...", *file)
-	nodeSet := cft.NewCfNodeSetWithFile(*file)
+	log.Printf("initializing from %s (pool size %d)...", *file, *poolSize)
+	mgr := cft.NewPoolManagerWithFile(*poolSize, *file)
 
-	// Refresh if we have no active nodes
-	list := nodeSet.List()
-	active := 0
-	for _, ns := range list {
-		if !ns.IsBanned() {
-			active++
-		}
-	}
-	if active < *topN {
-		log.Printf("refreshing nodes (have %d, need %d)...", active, *topN)
-		if err := nodeSet.Refresh(*topN); err != nil {
-			log.Fatalf("refresh failed: %v", err)
-		}
-	}
+	// Refresh if pool is underfilled
+	mgr.RefreshPool()
 
-	list = nodeSet.List()
-	var pool []string
-	for _, ns := range list {
-		if !ns.IsBanned() {
-			pool = append(pool, string(ns.Node))
-		}
-	}
-	if len(pool) == 0 {
+	if mgr.PoolLen() == 0 {
 		log.Fatal("no available CF nodes after refresh")
 	}
-	log.Printf("ready with %d nodes: %v", len(pool), pool)
+	log.Printf("ready with %d nodes in pool", mgr.PoolLen())
 
-	// Start SNI proxy
+	// Start TCP proxy
 	addr := fmt.Sprintf(":%d", *port)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -63,23 +44,28 @@ func main() {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go handleConn(conn, pool, &index)
+		go handleConn(conn, mgr, &index)
 	}
 }
 
 // handleConn pipes traffic bidirectionally to a CF edge node on port 443.
-func handleConn(clientConn net.Conn, pool []string, index *atomic.Uint64) {
+func handleConn(clientConn net.Conn, mgr *cft.PoolManager, index *atomic.Uint64) {
 	defer clientConn.Close()
 
-	// Round-robin pick a CF node
-	idx := int(index.Add(1)-1) % len(pool)
-	ip := pool[idx]
+	// Get one IP from pool
+	ips := mgr.Take(1, index)
+	if len(ips) == 0 {
+		log.Printf("no available nodes")
+		return
+	}
+	ip := ips[0]
 
 	// Dial CF edge on port 443
 	remoteAddr := fmt.Sprintf("%s:443", ip)
 	remoteConn, err := net.DialTimeout("tcp", remoteAddr, 5*time.Second)
 	if err != nil {
 		log.Printf("dial %s failed: %v", remoteAddr, err)
+		mgr.RecordFailure(cft.CfNode(ip))
 		return
 	}
 	defer remoteConn.Close()

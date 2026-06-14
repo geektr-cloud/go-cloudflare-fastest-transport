@@ -3,7 +3,6 @@ package cftransport
 import (
 	"math/rand"
 	"net"
-	"strings"
 )
 
 // Cloudflare IPv4 CIDR ranges.
@@ -92,16 +91,4 @@ func ipsFromCIDR(cidr string) []CfNode {
 	}
 
 	return nodes
-}
-
-// shuffleNodes randomizes the order of a CfNode slice in-place.
-func shuffleNodes(nodes []CfNode) {
-	rand.Shuffle(len(nodes), func(i, j int) {
-		nodes[i], nodes[j] = nodes[j], nodes[i]
-	})
-}
-
-// isIPv4 checks if a string is an IPv4 address.
-func isIPv4(ip string) bool {
-	return strings.Contains(ip, ".") && !strings.Contains(ip, ":")
 }

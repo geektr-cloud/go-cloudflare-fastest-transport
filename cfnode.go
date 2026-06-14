@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/VividCortex/ewma"
 )
 
 const (
@@ -165,49 +163,25 @@ func (n CfNode) SpeedTest(timeout time.Duration) (speed float64, err error) {
 
 	timeStart := time.Now()
 	timeEnd := timeStart.Add(timeout)
-	contentLength := resp.ContentLength
 	buffer := make([]byte, downloadBufSize)
+	var contentRead int64
 
-	var (
-		contentRead     int64
-		timeSlice             = timeout / 100
-		timeCounter           = 1
-		lastContentRead int64
-	)
-
-	nextTime := timeStart.Add(timeSlice * time.Duration(timeCounter))
-	e := ewma.NewMovingAverage()
-
-	for contentLength != contentRead {
-		now := time.Now()
-		if now.After(nextTime) {
-			timeCounter++
-			nextTime = timeStart.Add(timeSlice * time.Duration(timeCounter))
-			e.Add(float64(contentRead - lastContentRead))
-			lastContentRead = contentRead
-		}
-		if now.After(timeEnd) {
+	for {
+		if time.Now().After(timeEnd) {
 			break
 		}
 		bufRead, readErr := resp.Body.Read(buffer)
-		if readErr != nil {
-			if readErr != io.EOF {
-				break
-			}
-			if contentLength == -1 {
-				break
-			}
-			lastSlice := timeStart.Add(timeSlice * time.Duration(timeCounter - 1))
-			elapsed := float64(now.Sub(lastSlice)) / float64(timeSlice)
-			if elapsed > 0 {
-				e.Add(float64(contentRead-lastContentRead) / elapsed)
-			}
-		}
 		contentRead += int64(bufRead)
+		if readErr != nil {
+			break
+		}
 	}
 
-	// Convert EWMA value to bytes/sec
-	speed = e.Value() / (timeout.Seconds() / 120)
+	elapsed := time.Since(timeStart).Seconds()
+	if elapsed <= 0 {
+		return 0, nil
+	}
+	speed = float64(contentRead) / elapsed
 	return speed, nil
 }
 
